@@ -38,7 +38,7 @@
 
 1. **Clone the repository**
 ```bash
-git clone https://github.com/yourusername/yt-telegram-bot.git
+git clone https://github.com/sharifwr01/ytdl.git
 cd yt-telegram-bot
 ```
 
@@ -62,7 +62,7 @@ docker-compose logs -f bot
 
 1. **Clone এবং virtual environment তৈরি করুন**
 ```bash
-git clone https://github.com/yourusername/yt-telegram-bot.git
+git clone https://github.com/sharifwr01/ytdl.git
 cd yt-telegram-bot
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
