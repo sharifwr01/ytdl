@@ -1,0 +1,113 @@
+version: '3.8'
+
+services:
+  # Redis for caching and queue
+  redis:
+    image: redis:7-alpine
+    container_name: yt_bot_redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # PostgreSQL database (optional, can use SQLite)
+  postgres:
+    image: postgres:15-alpine
+    container_name: yt_bot_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ytbot
+      POSTGRES_USER: ytbot
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ytbot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Main bot application
+  bot:
+    build: .
+    container_name: yt_bot_app
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      # Telegram
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
+      
+      # Database
+      DB_URL: postgresql+asyncpg://ytbot:${DB_PASSWORD:-changeme}@postgres:5432/ytbot
+      # Or use SQLite: sqlite+aiosqlite:///bot.db
+      
+      # Redis
+      REDIS_URL: redis://redis:6379
+      
+      # Limits
+      MAX_FILE_MB: ${MAX_FILE_MB:-50}
+      TELEGRAM_UPLOAD_LIMIT_MB: ${TELEGRAM_UPLOAD_LIMIT_MB:-50}
+      MAX_CONCURRENT_DOWNLOADS: ${MAX_CONCURRENT_DOWNLOADS:-3}
+      RATE_LIMIT_PER_USER_PER_DAY: ${RATE_LIMIT_PER_USER_PER_DAY:-20}
+      
+      # Admin
+      ADMIN_USER_IDS: ${ADMIN_USER_IDS:-}
+      
+      # Storage
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      GDRIVE_CLIENT_ID: ${GDRIVE_CLIENT_ID:-}
+      GDRIVE_CLIENT_SECRET: ${GDRIVE_CLIENT_SECRET:-}
+      
+      # AWS S3 (optional)
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      
+      # Monitoring (optional)
+      SENTRY_DSN: ${SENTRY_DSN:-}
+    
+    volumes:
+      - ./logs:/app/logs
+      - bot_tmp:/tmp/yt_bot
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # Nginx reverse proxy (optional, for webhook mode)
+  nginx:
+    image: nginx:alpine
+    container_name: yt_bot_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - bot
+    profiles:
+      - webhook
+
+volumes:
+  redis_data:
+  postgres_data:
+  bot_tmp:
