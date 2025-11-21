@@ -1,14 +1,15 @@
 # ⚡ Quick Start Guide
 
-5 মিনিটে YouTube Telegram Bot setup করুন!
+10 মিনিটে YouTube Telegram Bot setup করুন - **4K support + 4GB upload + Google Drive!**
 
 ## 📦 Prerequisites
 
-শুধুমাত্র এই দুটি জিনিস দরকার:
 - Docker & Docker Compose
 - Telegram Bot Token
+- **Telegram API_ID & API_HASH** (4GB upload এর জন্য required)
+- Google Drive API Credentials (optional, for cloud storage)
 
-## 🚀 Installation (5 মিনিট)
+## 🚀 Installation (10 মিনিট)
 
 ### Step 1: Bot Token নিন (2 মিনিট)
 
@@ -18,7 +19,22 @@
 4. Username দিন (e.g., "my_youtube_bot")
 5. Token copy করুন (দেখতে এরকম: `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`)
 
-### Step 2: Bot Setup করুন (3 মিনিট)
+### Step 2: API Credentials নিন (3 মিনিট) - **REQUIRED for 4GB upload**
+
+1. **https://my.telegram.org** এ যান
+2. Phone number দিয়ে login করুন
+3. "API Development Tools" click করুন
+4. Form fill করুন:
+   - App title: `YouTube Bot`
+   - Short name: `yt_bot`
+5. "Create Application" click করুন
+6. **Copy করুন:**
+   - `api_id`: একটি number (e.g., `12345678`)
+   - `api_hash`: একটি string (e.g., `0123456789abcdef...`)
+
+**বিস্তারিত guide:** [API_SETUP.md](API_SETUP.md)
+
+### Step 3: Bot Setup করুন (5 মিনিট)
 
 ```bash
 # 1. Repository clone করুন
@@ -28,9 +44,12 @@ cd yt-telegram-bot
 # 2. Environment file তৈরি করুন
 cp .env.example .env
 
-# 3. আপনার bot token দিন
+# 3. আপনার credentials দিন
 nano .env  # অথবা যেকোনো text editor
-# TELEGRAM_TOKEN=আপনার_বট_টোকেন_এখানে
+# এই values গুলো যোগ করুন:
+# TELEGRAM_TOKEN=আপনার_বট_টোকেন
+# API_ID=আপনার_api_id
+# API_HASH=আপনার_api_hash
 
 # 4. Bot start করুন
 docker-compose up -d
@@ -39,7 +58,21 @@ docker-compose up -d
 docker-compose logs -f bot
 ```
 
-### Step 3: Test করুন! ✅
+### Step 3: (Optional) Google Drive Setup
+
+বড় files এর জন্য Google Drive connect করুন:
+
+1. [GDRIVE_SETUP.md](GDRIVE_SETUP.md) guide follow করুন
+2. Google Cloud Console এ credentials তৈরি করুন
+3. `.env` file এ credentials যোগ করুন:
+```env
+GDRIVE_CLIENT_ID=your_client_id.apps.googleusercontent.com
+GDRIVE_CLIENT_SECRET=your_client_secret
+```
+4. Bot restart করুন: `docker-compose restart`
+5. Telegram এ `/gdrive` command দিয়ে connect করুন
+
+### Step 4: Test করুন! ✅
 
 1. Telegram এ আপনার bot খুলুন
 2. `/start` command দিন
@@ -55,23 +88,31 @@ docker-compose logs -f bot
 /start    - Bot চালু করুন
 /help     - সাহায্য দেখুন
 /status   - আপনার stats দেখুন
-/settings - ভাষা পরিবর্তন করুন
+/gdrive   - Google Drive সংযুক্ত করুন
+/admin    - Admin panel (শুধু admin)
 ```
 
 ### Download করার পদ্ধতি
 
-1. **Video Download:**
+1. **4K Video Download:**
    ```
    পাঠান: https://youtube.com/watch?v=VIDEO_ID
    Format: Video চুজ করুন
-   Quality: 720p অথবা আপনার পছন্দের quality
+   Quality: 4K (2160p) অথবা Best
    ```
 
-2. **Audio Download (MP3):**
+2. **High Quality Audio (320kbps MP3):**
    ```
    পাঠান: https://youtube.com/watch?v=VIDEO_ID
    Format: Audio চুজ করুন
    Quality: Best Quality
+   ```
+
+3. **বড় Files (50MB+):**
+   ```
+   Download complete হলে দুটি option:
+   📱 Telegram এ পাঠান (2GB পর্যন্ত)
+   ☁️ Google Drive এ সেভ করুন
    ```
 
 ## ⚙️ Configuration
@@ -82,12 +123,26 @@ docker-compose logs -f bot
 # Required - আপনার bot token
 TELEGRAM_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
 
-# Optional - Limits
-RATE_LIMIT_PER_USER_PER_DAY=20  # প্রতিদিন 20টি download
-MAX_FILE_MB=50                   # Maximum 50MB direct upload
+# Required - API credentials (4GB upload এর জন্য)
+API_ID=12345678
+API_HASH=0123456789abcdef0123456789abcdef
 
-# Optional - Admin
-ADMIN_USER_IDS=123456789         # আপনার Telegram User ID
+# Limits (4GB Telegram Upload Enabled via Pyrogram!)
+RATE_LIMIT_PER_USER_PER_DAY=50   # প্রতিদিন 50টি download
+MAX_FILE_MB=4000                  # 4GB পর্যন্ত
+TELEGRAM_UPLOAD_LIMIT_MB=4000    # 4GB direct upload
+
+# Admin
+ADMIN_USER_IDS=123456789          # আপনার Telegram User ID
+
+# Google Drive (Optional but recommended)
+GDRIVE_CLIENT_ID=your_client_id.apps.googleusercontent.com
+GDRIVE_CLIENT_SECRET=your_client_secret
+STORAGE_BACKEND=gdrive
+
+# Performance (Maximum Speed!)
+MAX_CONCURRENT_DOWNLOADS=5
+YT_DLP_CONCURRENT_FRAGMENTS=10
 ```
 
 ### আপনার Telegram User ID কিভাবে খুঁজবেন?

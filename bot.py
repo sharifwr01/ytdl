@@ -507,6 +507,220 @@ async def callback_quality(callback: types.CallbackQuery, state: FSMContext):
         get_text(user.language, "downloading", progress="0")
     )
     
+    file_path = None
+    try:
+        # Download file
+        file_path = await download_video(url, format_type, quality, status_msg, user)
+        
+        if not file_path or not file_path.exists():
+            raise Exception("Download failed")
+        
+        # Check file size
+        file_size_mb = file_path.stat().st_size / (1024 * 1024)
+        
+        # Show storage options for files > 50MB
+        if file_size_mb > 50:
+            await state.update_data(file_path=str(file_path), file_size_mb=file_size_mb, format=format_type)
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text=get_text(user.language, "telegram_direct"), 
+                    callback_data="storage_telegram"
+                )],
+                [InlineKeyboardButton(
+                    text=get_text(user.language, "save_gdrive"), 
+                    callback_data="storage_gdrive"
+                )],
+            ])
+            
+            await status_msg.edit_text(
+                get_text(user.language, "file_info", size=f"{file_size_mb:.1f}"),
+                reply_markup=keyboard
+            )
+            await state.set_state(DownloadStates.selecting_storage)
+            await callback.answer()
+            return
+        
+        # Upload small files directly (< 50MB)
+        await status_msg.edit_text(
+            get_text(user.language, "uploading", progress="0")
+        )
+        
+        if format_type == "audio":
+            await callback.message.answer_audio(
+                FSInputFile(file_path),
+                caption=get_text(user.language, "completed")
+            )
+        else:
+            await callback.message.answer_video(
+                FSInputFile(file_path),
+                caption=get_text(user.language, "completed"),
+                supports_streaming=True
+            )
+        
+        await status_msg.delete()
+        
+        # Update user stats
+        async with async_session() as session:
+            result = await session.execute(
+                select(User).where(User.telegram_id == user.telegram_id)
+            )
+            db_user = result.scalar_one()
+            db_user.total_downloads += 1
+            await session.commit()
+        
+    except Exception as e:
+        logger.error(f"Download failed: {e}")
+        await status_msg.edit_text(
+            get_text(user.language, "failed", error=str(e))
+        )
+    finally:
+        # Always cleanup file from VPS
+        if file_path:
+            await cleanup_file(file_path)
+    
+    await state.clear()
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("storage_"))
+async def callback_storage(callback: types.CallbackQuery, state: FSMContext):
+    """Handle storage option selection"""
+    storage_type = callback.data.split("_")[1]
+    data = await state.get_data()
+    
+    file_path = Path(data.get("file_path"))
+    file_size_mb = data.get("file_size_mb", 0)
+    format_type = data.get("format")
+    user = await get_or_create_user(callback.from_user.id)
+    
+    try:
+        if storage_type == "telegram":
+            # Upload to Telegram using Pyrogram (up to 4GB)
+            status_msg = await callback.message.edit_text(
+                get_text(user.language, "uploading_telegram", progress="0")
+            )
+            
+            is_audio = format_type == "audio"
+            caption = get_text(user.language, "completed")
+            
+            # Use Pyrogram for large file upload
+            success = await upload_large_file_pyrogram(
+                file_path=file_path,
+                chat_id=callback.message.chat.id,
+                caption=caption,
+                status_msg=status_msg,
+                user_lang=user.language,
+                is_audio=is_audio
+            )
+            
+            if success:
+                await status_msg.delete()
+            else:
+                await status_msg.edit_text(
+                    get_text(user.language, "failed", error="Upload failed")
+                )
+            
+        elif storage_type == "gdrive":
+            # Check if GDrive is connected
+            if not user.gdrive_token:
+                await callback.message.edit_text(
+                    get_text(user.language, "gdrive_not_connected")
+                )
+                await callback.answer()
+                return
+            
+            # Upload to Google Drive
+            status_msg = callback.message
+            gdrive_link = await upload_to_gdrive(file_path, user, status_msg)
+            
+            if gdrive_link:
+                await callback.message.answer(
+                    get_text(
+                        user.language, 
+                        "gdrive_link", 
+                        url=gdrive_link,
+                        size=f"{file_size_mb:.1f}"
+                    )
+                )
+                await status_msg.delete()
+            else:
+                await callback.message.edit_text(
+                    get_text(user.language, "gdrive_error")
+                )
+        
+        # Update user stats
+        async with async_session() as session:
+            result = await session.execute(
+                select(User).where(User.telegram_id == user.telegram_id)
+            )
+            db_user = result.scalar_one()
+            db_user.total_downloads += 1
+            await session.commit()
+        
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        await callback.message.answer(
+            get_text(user.language, "failed", error=str(e))
+        )
+    finally:
+        # Always cleanup file from VPS
+        await cleanup_file(file_path)
+    
+    await state.clear()
+    await callback.answer()
+
+async def cleanup_old_files():
+    """Periodic cleanup of old files"""
+    while True:
+        try:
+            cutoff_time = datetime.now().timestamp() - 600
+            for file in TMP_DIR.glob("*"):
+                if file.is_file() and file.stat().st_mtime < cutoff_time:
+                    file.unlink()
+                    logger.info(f"Cleaned up old file: {file}")
+        except Exception as e:
+            logger.error(f"Cleanup task error: {e}")
+        
+        await asyncio.sleep(300)
+
+async def main():
+    """Main function"""
+    logger.info("Starting YouTube Download Bot with Pyrogram...")
+    logger.info(f"API ID: {API_ID}")
+    logger.info(f"Admin IDs: {ADMIN_USER_IDS}")
+    logger.info(f"Max file size: {TELEGRAM_UPLOAD_LIMIT_MB}MB (4GB via Pyrogram)")
+    logger.info(f"Storage backend: {STORAGE_BACKEND}")
+    
+    # Initialize database
+    await init_db()
+    
+    # Start Pyrogram client
+    await app.start()
+    logger.info("Pyrogram client started")
+    
+    # Start cleanup task
+    asyncio.create_task(cleanup_old_files())
+    
+    # Start polling
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await app.stop()
+        await bot.session.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())1]
+    data = await state.get_data()
+    
+    url = data.get("url")
+    format_type = data.get("format")
+    
+    user = await get_or_create_user(callback.from_user.id)
+    
+    status_msg = await callback.message.edit_text(
+        get_text(user.language, "downloading", progress="0")
+    )
+    
     try:
         # Download file
         file_path = await download_video(url, format_type, quality, status_msg, user)

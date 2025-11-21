@@ -5,23 +5,27 @@
 ## ✨ Features
 
 ### Core Features
-- ✅ **Video & Audio Download** - Multiple formats এবং qualities
-- ✅ **Playlist Support** - পুরো playlist বা specific videos
-- ✅ **Progress Tracking** - Real-time download progress
-- ✅ **Multiple Languages** - English এবং বাংলা support
-- ✅ **Rate Limiting** - Per-user daily limits
-- ✅ **Cloud Storage** - বড় files এর জন্য Google Drive/S3 integration
-- ✅ **Queue Management** - Concurrent downloads with queue
-- ✅ **Admin Panel** - Admin-only commands
+- ✅ **4K Video Download** - 2160p (4K) পর্যন্ত support
+- ✅ **4GB Telegram Upload** - Pyrogram Client API দিয়ে
+- ✅ **Google Drive Integration** - Unlimited storage
+- ✅ **No VPS Storage** - Download হয়ে immediately delete
+- ✅ **Maximum Speed** - সম্পূর্ণ bandwidth ব্যবহার
+- ✅ **Audio Download** - 320kbps MP3 conversion
+- ✅ **Progress Tracking** - Real-time upload/download progress
+- ✅ **Bangla Interface** - সম্পূর্ণ বাংলা support
+- ✅ **Admin Panel** - Advanced admin controls
 
 ### Advanced Features
-- 🎚️ Multiple quality options (1080p, 720p, 480p, 360p, best)
-- 🎵 Audio extraction with MP3 conversion
+- 🎚️ Quality options: 4K, 2K, 1080p, 720p, 480p, 360p, best
+- 🎵 High-quality audio extraction (320kbps MP3)
 - 📊 User statistics tracking
-- 🔒 Rate limiting এবং abuse prevention
-- ☁️ Automatic cloud upload for large files
+- 🔒 Rate limiting (50 downloads/day default)
+- ☁️ Google Drive auto-upload with YTDL folder
 - 📝 Detailed logging এবং error handling
-- 🌍 Multi-language support (i18n)
+- 🚀 Multi-threaded downloads (10 concurrent fragments)
+- 💾 Zero VPS storage - instant cleanup
+- 👑 Admin commands and management
+- 🔄 Resumable uploads via Pyrogram
 
 ## 🚀 Quick Start
 
@@ -29,6 +33,7 @@
 - Python 3.11+
 - Docker এবং Docker Compose (optional)
 - Telegram Bot Token ([BotFather](https://t.me/botfather) থেকে নিন)
+- **Telegram API_ID এবং API_HASH** ([my.telegram.org](https://my.telegram.org) থেকে নিন)
 - Redis (caching এবং queue এর জন্য)
 - PostgreSQL (optional, SQLite default)
 
@@ -46,7 +51,14 @@ cd yt-telegram-bot
 ```bash
 cp .env.example .env
 nano .env  # আপনার configuration দিন
+
+# Required:
+TELEGRAM_TOKEN=your_bot_token
+API_ID=12345678  # from my.telegram.org
+API_HASH=your_api_hash  # from my.telegram.org
 ```
+
+**⚠️ Important:** API_ID এবং API_HASH setup করতে [API_SETUP.md](API_SETUP.md) guide follow করুন।
 
 3. **Start the bot**
 ```bash
