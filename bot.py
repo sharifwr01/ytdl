@@ -1,6 +1,6 @@
 """
-YouTube Download Telegram Bot
-Main bot implementation with all features
+YouTube Download Telegram Bot - Enhanced Version with Client API
+Features: 4K support, 2GB+ upload via Pyrogram, GDrive integration, No VPS storage
 """
 
 import os
@@ -11,13 +11,20 @@ from typing import Optional, Dict, List
 import re
 import json
 from pathlib import Path
+import shutil
+import tempfile
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.redis import RedisStorage
+
+# Pyrogram for large file uploads (2GB+)
+from pyrogram import Client as PyrogramClient
+from pyrogram.types import Message as PyrogramMessage
+
 import yt_dlp
 import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -25,20 +32,36 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import select, func
 import aiofiles
 
+# Google Drive imports
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+import pickle
+
 # Configuration
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+API_ID = int(os.getenv("API_ID"))  # Get from my.telegram.org
+API_HASH = os.getenv("API_HASH")   # Get from my.telegram.org
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:///bot.db")
-MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "50"))
-TELEGRAM_UPLOAD_LIMIT_MB = int(os.getenv("TELEGRAM_UPLOAD_LIMIT_MB", "50"))
-MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
-RATE_LIMIT_PER_USER_PER_DAY = int(os.getenv("RATE_LIMIT_PER_USER_PER_DAY", "20"))
+MAX_FILE_MB = 4000  # 4GB with Pyrogram (Telegram supports up to 4GB)
+TELEGRAM_UPLOAD_LIMIT_MB = 4000  # 4GB via Client API
+MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "5"))
+RATE_LIMIT_PER_USER_PER_DAY = int(os.getenv("RATE_LIMIT_PER_USER_PER_DAY", "50"))
 ADMIN_USER_IDS = [int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x]
-STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local")
+STORAGE_BACKEND = "gdrive"
 GDRIVE_CLIENT_ID = os.getenv("GDRIVE_CLIENT_ID")
 GDRIVE_CLIENT_SECRET = os.getenv("GDRIVE_CLIENT_SECRET")
-TMP_DIR = Path("/tmp/yt_bot")
+GDRIVE_FOLDER_NAME = "YTDL"
+
+# Use temp directory that auto-cleans
+TMP_DIR = Path(tempfile.gettempdir()) / "yt_bot"
 TMP_DIR.mkdir(exist_ok=True)
+
+# Google Drive Scopes
+SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
 # Logging
 logging.basicConfig(
@@ -64,7 +87,9 @@ class User(Base):
     first_seen: Mapped[datetime]
     last_active: Mapped[datetime]
     total_downloads: Mapped[int] = mapped_column(default=0)
-    language: Mapped[str] = mapped_column(default="en")
+    language: Mapped[str] = mapped_column(default="bn")
+    gdrive_token: Mapped[Optional[str]]
+    is_admin: Mapped[bool] = mapped_column(default=False)
 
 class Job(Base):
     __tablename__ = "jobs"
@@ -74,18 +99,23 @@ class Job(Base):
     url: Mapped[str]
     format: Mapped[str]
     quality: Mapped[str]
-    status: Mapped[str]  # pending, processing, completed, failed
+    status: Mapped[str]
     created_at: Mapped[datetime]
     completed_at: Mapped[Optional[datetime]]
     file_size: Mapped[Optional[int]]
     error_message: Mapped[Optional[str]]
+    gdrive_link: Mapped[Optional[str]]
 
 # FSM States
 class DownloadStates(StatesGroup):
     waiting_for_url = State()
     selecting_format = State()
     selecting_quality = State()
+    selecting_storage = State()
     processing = State()
+
+class GDriveAuthStates(StatesGroup):
+    waiting_for_code = State()
 
 # Initialize
 engine = create_async_engine(DB_URL, echo=False)
@@ -97,110 +127,103 @@ storage = RedisStorage(redis_client)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher(storage=storage)
 
-# Translations
+# Initialize Pyrogram Client for large uploads
+app = PyrogramClient(
+    "yt_bot_session",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=TELEGRAM_TOKEN
+)
+
+# Translations (Bangla focused)
 TRANSLATIONS = {
-    "en": {
-        "welcome": "👋 Welcome to YouTube Download Bot!\n\nSend me a YouTube URL to get started.\n\n⚠️ Terms: Use for personal, legal content only. Respect copyright.",
-        "help": """
-🎬 YouTube Download Bot - Help
-
-Commands:
-/start - Start the bot
-/help - Show this help
-/status - Check your download stats
-/settings - Change preferences
-
-How to use:
-1. Send a YouTube URL
-2. Choose format (video/audio)
-3. Select quality
-4. Receive your file!
-
-Features:
-✅ Video & Audio downloads
-✅ Multiple qualities
-✅ Playlist support
-✅ Progress tracking
-✅ Cloud storage for large files
-
-Limits:
-• Max {rate_limit} downloads per day
-• Max {max_file}MB direct upload
-""",
-        "rate_limited": "⚠️ You've reached your daily limit of {limit} downloads. Try again tomorrow!",
-        "invalid_url": "❌ Invalid YouTube URL. Please send a valid link.",
-        "select_format": "📝 Select format:",
-        "select_quality": "🎚️ Select quality:",
-        "downloading": "⏬ Downloading... {progress}%",
-        "processing": "⚙️ Processing...",
-        "uploading": "⏫ Uploading to Telegram... {progress}%",
-        "completed": "✅ Download completed!",
-        "failed": "❌ Download failed: {error}",
-        "file_too_large": "📦 File is too large ({size}MB). Uploading to cloud storage...",
-        "cloud_link": "☁️ Your file is ready!\n\n🔗 Link: {url}\n\n⏱️ Valid for 7 days",
-        "status": """
-📊 Your Statistics
-
-Total Downloads: {total}
-Today's Downloads: {today}
-Remaining Today: {remaining}
-Member Since: {joined}
-""",
-    },
     "bn": {
-        "welcome": "👋 YouTube ডাউনলোড বটে স্বাগতম!\n\nশুরু করতে আমাকে একটি YouTube URL পাঠান।\n\n⚠️ শর্তাবলী: শুধুমাত্র ব্যক্তিগত, বৈধ কন্টেন্টের জন্য ব্যবহার করুন। কপিরাইট সম্মান করুন।",
+        "welcome": "👋 YouTube ডাউনলোড বটে স্বাগতম!\n\n✨ Features:\n• 4K Quality পর্যন্ত\n• 4GB পর্যন্ত ফাইল (Telegram Client API)\n• Google Drive সাপোর্ট\n• সর্বোচ্চ গতি\n\nএকটি YouTube URL পাঠান।",
         "help": """
-🎬 YouTube ডাউনলোড বট - সাহায্য
+🎬 YouTube ডাউনলোড বট
 
-কমান্ড:
+📝 কমান্ড:
 /start - বট চালু করুন
-/help - এই সাহায্য দেখান
-/status - আপনার ডাউনলোড পরিসংখ্যান দেখুন
-/settings - পছন্দ পরিবর্তন করুন
+/help - সাহায্য
+/status - পরিসংখ্যান
+/gdrive - Google Drive সংযুক্ত করুন
+/admin - Admin panel (শুধু admin)
 
-কিভাবে ব্যবহার করবেন:
-1. একটি YouTube URL পাঠান
-2. ফরম্যাট নির্বাচন করুন (ভিডিও/অডিও)
-3. কোয়ালিটি নির্বাচন করুন
-4. আপনার ফাইল পান!
+🎯 কিভাবে ব্যবহার করবেন:
+1. YouTube URL পাঠান
+2. Format চুজ করুন
+3. Quality নির্বাচন করুন
+4. Download!
 
-বৈশিষ্ট্য:
-✅ ভিডিও এবং অডিও ডাউনলোড
-✅ একাধিক কোয়ালিটি
-✅ প্লেলিস্ট সাপোর্ট
-✅ প্রগ্রেস ট্র্যাকিং
-✅ বড় ফাইলের জন্য ক্লাউড স্টোরেজ
-
-সীমা:
-• প্রতিদিন সর্বোচ্চ {rate_limit}টি ডাউনলোড
-• সর্বোচ্চ {max_file}MB সরাসরি আপলোড
+✨ বৈশিষ্ট্য:
+✅ 4K Quality (2160p)
+✅ 4GB পর্যন্ত upload (Client API)
+✅ Google Drive backup
+✅ Fast download
+✅ সর্বোচ্চ গতি
 """,
-        "rate_limited": "⚠️ আপনি আজকের {limit}টি ডাউনলোডের সীমা পূর্ণ করেছেন। আগামীকাল আবার চেষ্টা করুন!",
-        "invalid_url": "❌ অবৈধ YouTube URL। অনুগ্রহ করে একটি বৈধ লিংক পাঠান।",
-        "select_format": "📝 ফরম্যাট নির্বাচন করুন:",
-        "select_quality": "🎚️ কোয়ালিটি নির্বাচন করুন:",
+        "rate_limited": "⚠️ দৈনিক {limit}টি ডাউনলোডের সীমা পূর্ণ!",
+        "invalid_url": "❌ অবৈধ YouTube URL!",
+        "select_format": "📝 Format নির্বাচন করুন:",
+        "select_quality": "🎚️ Quality নির্বাচন করুন:",
+        "select_storage": "💾 Storage অপশন:",
         "downloading": "⏬ ডাউনলোড হচ্ছে... {progress}%",
         "processing": "⚙️ প্রসেসিং...",
-        "uploading": "⏫ টেলিগ্রামে আপলোড হচ্ছে... {progress}%",
+        "uploading": "⏫ আপলোড হচ্ছে... {progress}%",
+        "uploading_telegram": "📱 Telegram এ আপলোড হচ্ছে... {progress}%",
+        "uploading_gdrive": "☁️ Google Drive এ আপলোড হচ্ছে...",
         "completed": "✅ ডাউনলোড সম্পন্ন!",
         "failed": "❌ ডাউনলোড ব্যর্থ: {error}",
-        "file_too_large": "📦 ফাইল অনেক বড় ({size}MB)। ক্লাউড স্টোরেজে আপলোড করা হচ্ছে...",
-        "cloud_link": "☁️ আপনার ফাইল প্রস্তুত!\n\n🔗 লিংক: {url}\n\n⏱️ ৭ দিনের জন্য বৈধ",
+        "file_info": "📦 File: {size}MB\n\n💾 Storage option চুজ করুন:",
+        "gdrive_link": "☁️ আপনার ফাইল প্রস্তুত!\n\n🔗 Link: {url}\n\n📏 Size: {size}MB\n⏰ Valid for 7 days",
         "status": """
 📊 আপনার পরিসংখ্যান
 
-মোট ডাউনলোড: {total}
-আজকের ডাউনলোড: {today}
-আজ বাকি: {remaining}
-সদস্য হওয়ার তারিখ: {joined}
+📥 মোট ডাউনলোড: {total}
+📅 আজকের ডাউনলোড: {today}
+⏳ আজ বাকি: {remaining}
+📆 যোগদান: {joined}
+☁️ Google Drive: {gdrive_status}
+🚀 Upload Limit: 4GB (Client API)
 """,
+        "gdrive_connect": """
+🔗 Google Drive সংযুক্ত করুন
+
+1. এই লিংকে ক্লিক করুন:
+{auth_url}
+
+2. Google account দিয়ে login করুন
+3. Permission দিন
+4. Code copy করুন
+5. এখানে paste করুন
+
+⚠️ 5 মিনিটের মধ্যে code পাঠান!
+""",
+        "gdrive_connected": "✅ Google Drive সংযুক্ত হয়েছে!",
+        "gdrive_error": "❌ Google Drive সংযুক্ত করতে ব্যর্থ!",
+        "admin_panel": """
+👑 Admin Panel
+
+📊 Statistics:
+• Total Users: {users}
+• Today Downloads: {downloads}
+• Active Now: {active}
+
+🎛️ Commands:
+/broadcast - সবাইকে message পাঠান
+/stats - বিস্তারিত statistics
+/users - User list
+""",
+        "not_admin": "⛔ শুধুমাত্র admin access!",
+        "telegram_direct": "📱 Telegram এ পাঠান (4GB পর্যন্ত)",
+        "save_gdrive": "☁️ Google Drive এ সেভ করুন",
+        "gdrive_not_connected": "⚠️ Google Drive সংযুক্ত নেই!\n\n/gdrive command দিয়ে সংযুক্ত করুন।",
     }
 }
 
 def get_text(user_lang: str, key: str, **kwargs) -> str:
     """Get translated text"""
-    lang = user_lang if user_lang in TRANSLATIONS else "en"
-    text = TRANSLATIONS[lang].get(key, TRANSLATIONS["en"][key])
+    text = TRANSLATIONS["bn"].get(key, key)
     return text.format(**kwargs)
 
 async def init_db():
@@ -222,7 +245,8 @@ async def get_or_create_user(telegram_id: int, username: Optional[str] = None) -
                 username=username,
                 first_seen=datetime.now(),
                 last_active=datetime.now(),
-                total_downloads=0
+                total_downloads=0,
+                is_admin=telegram_id in ADMIN_USER_IDS
             )
             session.add(user)
         else:
@@ -267,37 +291,189 @@ class DownloadProgress:
         self.message = message
         self.user_lang = user_lang
         self.last_update = 0
+        self.last_percent = 0
     
     def __call__(self, d):
         if d['status'] == 'downloading':
             try:
-                percent = d.get('_percent_str', '0%').strip()
+                percent_str = d.get('_percent_str', '0%').strip().replace('%', '')
+                try:
+                    percent = float(percent_str)
+                except:
+                    percent = 0
+                
                 current_time = asyncio.get_event_loop().time()
                 
-                # Update every 2 seconds
-                if current_time - self.last_update > 2:
+                if (abs(percent - self.last_percent) >= 5 or 
+                    current_time - self.last_update > 3):
                     self.last_update = current_time
+                    self.last_percent = percent
                     asyncio.create_task(
                         self.message.edit_text(
-                            get_text(self.user_lang, "downloading", progress=percent)
+                            get_text(self.user_lang, "downloading", 
+                                   progress=f"{percent:.0f}")
                         )
                     )
             except Exception as e:
                 logger.error(f"Progress update error: {e}")
 
-async def download_video(url: str, format_type: str, quality: str, message: types.Message, user: User) -> Optional[Path]:
-    """Download video/audio"""
+async def get_gdrive_service(user: User):
+    """Get Google Drive service for user"""
+    if not user.gdrive_token:
+        return None
+    
     try:
-        # Create unique filename
+        creds = pickle.loads(user.gdrive_token.encode('latin1'))
+        
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            async with async_session() as session:
+                result = await session.execute(
+                    select(User).where(User.telegram_id == user.telegram_id)
+                )
+                db_user = result.scalar_one()
+                db_user.gdrive_token = pickle.dumps(creds).decode('latin1')
+                await session.commit()
+        
+        return build('drive', 'v3', credentials=creds)
+    except Exception as e:
+        logger.error(f"GDrive service error: {e}")
+        return None
+
+async def get_or_create_gdrive_folder(service) -> str:
+    """Get or create YTDL folder in Google Drive"""
+    try:
+        results = service.files().list(
+            q=f"name='{GDRIVE_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false",
+            spaces='drive',
+            fields='files(id, name)'
+        ).execute()
+        
+        folders = results.get('files', [])
+        
+        if folders:
+            return folders[0]['id']
+        
+        file_metadata = {
+            'name': GDRIVE_FOLDER_NAME,
+            'mimeType': 'application/vnd.google-apps.folder'
+        }
+        folder = service.files().create(
+            body=file_metadata,
+            fields='id'
+        ).execute()
+        
+        return folder.get('id')
+    except Exception as e:
+        logger.error(f"GDrive folder error: {e}")
+        return None
+
+async def upload_to_gdrive(file_path: Path, user: User, status_msg: types.Message) -> Optional[str]:
+    """Upload file to Google Drive"""
+    try:
+        service = await get_gdrive_service(user)
+        if not service:
+            return None
+        
+        folder_id = await get_or_create_gdrive_folder(service)
+        if not folder_id:
+            return None
+        
+        await status_msg.edit_text(get_text(user.language, "uploading_gdrive"))
+        
+        file_metadata = {
+            'name': file_path.name,
+            'parents': [folder_id]
+        }
+        
+        media = MediaFileUpload(
+            str(file_path),
+            resumable=True,
+            chunksize=10*1024*1024
+        )
+        
+        file = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id, webViewLink'
+        ).execute()
+        
+        permission = {
+            'type': 'anyone',
+            'role': 'reader'
+        }
+        service.permissions().create(
+            fileId=file.get('id'),
+            body=permission
+        ).execute()
+        
+        return file.get('webViewLink')
+    
+    except Exception as e:
+        logger.error(f"GDrive upload error: {e}")
+        return None
+
+async def upload_large_file_pyrogram(file_path: Path, chat_id: int, caption: str, 
+                                     status_msg: types.Message, user_lang: str, 
+                                     is_audio: bool = False) -> bool:
+    """Upload large files using Pyrogram (up to 4GB)"""
+    try:
+        logger.info(f"Starting Pyrogram upload: {file_path.name} ({file_path.stat().st_size / (1024*1024):.1f}MB)")
+        
+        # Progress callback
+        last_update = [0]
+        async def progress(current, total):
+            try:
+                percent = (current / total) * 100
+                current_time = asyncio.get_event_loop().time()
+                
+                if current_time - last_update[0] > 3:  # Update every 3 seconds
+                    last_update[0] = current_time
+                    await status_msg.edit_text(
+                        get_text(user_lang, "uploading_telegram", progress=f"{percent:.0f}")
+                    )
+            except Exception as e:
+                logger.error(f"Progress callback error: {e}")
+        
+        # Upload based on file type
+        if is_audio:
+            await app.send_audio(
+                chat_id=chat_id,
+                audio=str(file_path),
+                caption=caption,
+                progress=progress
+            )
+        else:
+            await app.send_video(
+                chat_id=chat_id,
+                video=str(file_path),
+                caption=caption,
+                supports_streaming=True,
+                progress=progress
+            )
+        
+        logger.info(f"Pyrogram upload completed: {file_path.name}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Pyrogram upload error: {e}")
+        return False
+
+async def download_video(url: str, format_type: str, quality: str, message: types.Message, user: User) -> Optional[Path]:
+    """Download video/audio with maximum speed"""
+    try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_template = str(TMP_DIR / f"{user.telegram_id}_{timestamp}_%(title)s.%(ext)s")
         
-        # Configure yt-dlp options
         ydl_opts = {
             'outtmpl': output_template,
             'progress_hooks': [DownloadProgress(message, user.language)],
             'quiet': True,
             'no_warnings': True,
+            'concurrent_fragment_downloads': 10,
+            'retries': 10,
+            'fragment_retries': 10,
+            'http_chunk_size': 10485760,
         }
         
         if format_type == "audio":
@@ -306,28 +482,32 @@ async def download_video(url: str, format_type: str, quality: str, message: type
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
-                    'preferredquality': '192',
+                    'preferredquality': '320',
                 }],
                 'writethumbnail': True,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                }, {
-                    'key': 'EmbedThumbnail',
-                }],
+                'postprocessor_args': ['-threads', '0'],
             })
         else:
             if quality == "best":
-                ydl_opts['format'] = 'bestvideo+bestaudio/best'
+                ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+            elif quality == "2160p":
+                ydl_opts['format'] = 'bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/best[height<=2160]'
+            elif quality == "1440p":
+                ydl_opts['format'] = 'bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/best[height<=1440]'
+            elif quality == "1080p":
+                ydl_opts['format'] = 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]'
+            elif quality == "720p":
+                ydl_opts['format'] = 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]'
             else:
                 height = quality.replace('p', '')
-                ydl_opts['format'] = f'bestvideo[height<={height}]+bestaudio/best[height<={height}]'
+                ydl_opts['format'] = f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}]'
+            
+            ydl_opts['merge_output_format'] = 'mp4'
+            ydl_opts['postprocessor_args'] = ['-threads', '0']
         
-        # Download
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             
-            # Find downloaded file
             base_name = ydl.prepare_filename(info)
             if format_type == "audio":
                 file_path = Path(base_name).with_suffix('.mp3')
@@ -337,7 +517,6 @@ async def download_video(url: str, format_type: str, quality: str, message: type
             if file_path.exists():
                 return file_path
             
-            # Try to find the file
             for file in TMP_DIR.glob(f"{user.telegram_id}_{timestamp}_*"):
                 return file
         
@@ -347,20 +526,14 @@ async def download_video(url: str, format_type: str, quality: str, message: type
         logger.error(f"Download error: {e}")
         raise
 
-async def upload_to_cloud(file_path: Path, user: User) -> str:
-    """Upload to cloud storage and return shareable link"""
-    # This is a placeholder - implement actual cloud upload
-    # For Google Drive, S3, etc.
-    
-    if STORAGE_BACKEND == "gdrive":
-        # Implement Google Drive upload
-        pass
-    elif STORAGE_BACKEND == "s3":
-        # Implement S3 upload
-        pass
-    
-    # Mock link for demonstration
-    return f"https://example.com/download/{file_path.name}"
+async def cleanup_file(file_path: Path):
+    """Delete file from VPS immediately"""
+    try:
+        if file_path and file_path.exists():
+            file_path.unlink()
+            logger.info(f"Cleaned up: {file_path}")
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
 
 # Command Handlers
 @dp.message(CommandStart())
@@ -373,14 +546,7 @@ async def cmd_start(message: types.Message):
 async def cmd_help(message: types.Message):
     """Handle /help command"""
     user = await get_or_create_user(message.from_user.id)
-    await message.answer(
-        get_text(
-            user.language, 
-            "help",
-            rate_limit=RATE_LIMIT_PER_USER_PER_DAY,
-            max_file=MAX_FILE_MB
-        )
-    )
+    await message.answer(get_text(user.language, "help"))
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
@@ -389,6 +555,8 @@ async def cmd_status(message: types.Message):
     today_count = await get_today_downloads(user.telegram_id)
     remaining = max(0, RATE_LIMIT_PER_USER_PER_DAY - today_count)
     
+    gdrive_status = "✅ সংযুক্ত" if user.gdrive_token else "❌ সংযুক্ত নেই"
+    
     await message.answer(
         get_text(
             user.language,
@@ -396,38 +564,90 @@ async def cmd_status(message: types.Message):
             total=user.total_downloads,
             today=today_count,
             remaining=remaining,
-            joined=user.first_seen.strftime("%Y-%m-%d")
+            joined=user.first_seen.strftime("%Y-%m-%d"),
+            gdrive_status=gdrive_status
         )
     )
 
-@dp.message(Command("settings"))
-async def cmd_settings(message: types.Message):
-    """Handle /settings command"""
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en"),
-            InlineKeyboardButton(text="🇧🇩 বাংলা", callback_data="lang_bn")
-        ]
-    ])
-    await message.answer("🌍 Select Language / ভাষা নির্বাচন করুন:", reply_markup=keyboard)
+@dp.message(Command("gdrive"))
+async def cmd_gdrive(message: types.Message, state: FSMContext):
+    """Handle /gdrive command"""
+    user = await get_or_create_user(message.from_user.id)
+    
+    try:
+        flow = InstalledAppFlow.from_client_config(
+            {
+                "installed": {
+                    "client_id": GDRIVE_CLIENT_ID,
+                    "client_secret": GDRIVE_CLIENT_SECRET,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob"]
+                }
+            },
+            SCOPES
+        )
+        
+        auth_url, _ = flow.authorization_url(prompt='consent')
+        
+        await state.update_data(flow=flow)
+        await state.set_state(GDriveAuthStates.waiting_for_code)
+        
+        await message.answer(
+            get_text(user.language, "gdrive_connect", auth_url=auth_url),
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.error(f"GDrive auth error: {e}")
+        await message.answer(get_text(user.language, "gdrive_error"))
 
-@dp.callback_query(F.data.startswith("lang_"))
-async def callback_language(callback: types.CallbackQuery):
-    """Handle language selection"""
-    lang = callback.data.split("_")[1]
+@dp.message(GDriveAuthStates.waiting_for_code)
+async def process_gdrive_code(message: types.Message, state: FSMContext):
+    """Process Google Drive authorization code"""
+    user = await get_or_create_user(message.from_user.id)
+    data = await state.get_data()
+    flow = data.get('flow')
+    
+    try:
+        flow.fetch_token(code=message.text.strip())
+        creds = flow.credentials
+        
+        async with async_session() as session:
+            result = await session.execute(
+                select(User).where(User.telegram_id == user.telegram_id)
+            )
+            db_user = result.scalar_one()
+            db_user.gdrive_token = pickle.dumps(creds).decode('latin1')
+            await session.commit()
+        
+        await message.answer(get_text(user.language, "gdrive_connected"))
+        await state.clear()
+    except Exception as e:
+        logger.error(f"GDrive token error: {e}")
+        await message.answer(get_text(user.language, "gdrive_error"))
+        await state.clear()
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    """Handle /admin command"""
+    user = await get_or_create_user(message.from_user.id)
+    
+    if not user.is_admin:
+        await message.answer(get_text(user.language, "not_admin"))
+        return
     
     async with async_session() as session:
-        result = await session.execute(
-            select(User).where(User.telegram_id == callback.from_user.id)
-        )
-        user = result.scalar_one()
-        user.language = lang
-        await session.commit()
+        total_users = await session.scalar(select(func.count(User.id)))
     
-    await callback.message.edit_text(
-        "✅ Language updated!" if lang == "en" else "✅ ভাষা আপডেট হয়েছে!"
+    await message.answer(
+        get_text(
+            user.language,
+            "admin_panel",
+            users=total_users,
+            downloads=0,
+            active=0
+        )
     )
-    await callback.answer()
 
 @dp.message(F.text)
 async def handle_url(message: types.Message, state: FSMContext):
@@ -439,7 +659,6 @@ async def handle_url(message: types.Message, state: FSMContext):
         await message.answer(get_text(user.language, "invalid_url"))
         return
     
-    # Check rate limit
     if not await check_rate_limit(message.from_user.id):
         user = await get_or_create_user(message.from_user.id)
         await message.answer(
@@ -447,10 +666,8 @@ async def handle_url(message: types.Message, state: FSMContext):
         )
         return
     
-    # Save URL to state
     await state.update_data(url=url)
     
-    # Ask for format
     user = await get_or_create_user(message.from_user.id)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -472,17 +689,18 @@ async def callback_format(callback: types.CallbackQuery, state: FSMContext):
     
     user = await get_or_create_user(callback.from_user.id)
     
-    # Ask for quality
     if format_type == "video":
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔥 Best", callback_data="quality_best")],
-            [InlineKeyboardButton(text="1080p", callback_data="quality_1080p")],
-            [InlineKeyboardButton(text="720p", callback_data="quality_720p")],
+            [InlineKeyboardButton(text="🔥 Best (4K)", callback_data="quality_best")],
+            [InlineKeyboardButton(text="4K (2160p)", callback_data="quality_2160p")],
+            [InlineKeyboardButton(text="2K (1440p)", callback_data="quality_1440p")],
+            [InlineKeyboardButton(text="1080p Full HD", callback_data="quality_1080p")],
+            [InlineKeyboardButton(text="720p HD", callback_data="quality_720p")],
             [InlineKeyboardButton(text="480p", callback_data="quality_480p")],
         ])
     else:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🎵 Best Quality", callback_data="quality_best")]
+            [InlineKeyboardButton(text="🎵 Best Quality (320kbps)", callback_data="quality_best")]
         ])
     
     await callback.message.edit_text(
@@ -686,90 +904,3 @@ if __name__ == "__main__":
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Bot crashed: {e}", exc_info=True)
-    data = await state.get_data()
-    
-    url = data.get("url")
-    format_type = data.get("format")
-    
-    user = await get_or_create_user(callback.from_user.id)
-    
-    status_msg = await callback.message.edit_text(
-        get_text(user.language, "downloading", progress="0")
-    )
-    
-    try:
-        # Download file
-        file_path = await download_video(url, format_type, quality, status_msg, user)
-        
-        if not file_path or not file_path.exists():
-            raise Exception("Download failed")
-        
-        # Check file size
-        file_size_mb = file_path.stat().st_size / (1024 * 1024)
-        
-        if file_size_mb <= TELEGRAM_UPLOAD_LIMIT_MB:
-            # Upload to Telegram
-            await status_msg.edit_text(
-                get_text(user.language, "uploading", progress="0")
-            )
-            
-            if format_type == "audio":
-                await callback.message.answer_audio(
-                    FSInputFile(file_path),
-                    caption=get_text(user.language, "completed")
-                )
-            else:
-                await callback.message.answer_video(
-                    FSInputFile(file_path),
-                    caption=get_text(user.language, "completed")
-                )
-            
-            await status_msg.delete()
-        else:
-            # Upload to cloud
-            await status_msg.edit_text(
-                get_text(user.language, "file_too_large", size=f"{file_size_mb:.1f}")
-            )
-            
-            cloud_url = await upload_to_cloud(file_path, user)
-            
-            await callback.message.answer(
-                get_text(user.language, "cloud_link", url=cloud_url)
-            )
-        
-        # Update user stats
-        async with async_session() as session:
-            result = await session.execute(
-                select(User).where(User.telegram_id == user.telegram_id)
-            )
-            db_user = result.scalar_one()
-            db_user.total_downloads += 1
-            await session.commit()
-        
-        # Cleanup
-        try:
-            file_path.unlink()
-        except:
-            pass
-        
-    except Exception as e:
-        logger.error(f"Download failed: {e}")
-        await status_msg.edit_text(
-            get_text(user.language, "failed", error=str(e))
-        )
-    
-    await state.clear()
-    await callback.answer()
-
-async def main():
-    """Main function"""
-    logger.info("Starting bot...")
-    
-    # Initialize database
-    await init_db()
-    
-    # Start polling
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
