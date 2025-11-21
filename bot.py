@@ -685,7 +685,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
-        logger.error(f"Bot crashed: {e}", exc_info=True)1]
+        logger.error(f"Bot crashed: {e}", exc_info=True)
     data = await state.get_data()
     
     url = data.get("url")
