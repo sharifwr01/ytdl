@@ -518,69 +518,40 @@ async def callback_quality(callback: types.CallbackQuery, state: FSMContext):
         # Check file size
         file_size_mb = file_path.stat().st_size / (1024 * 1024)
         
-        # Show storage options for files > 50MB
-        if file_size_mb > 50:
-            await state.update_data(file_path=str(file_path), file_size_mb=file_size_mb, format=format_type)
-            
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text=get_text(user.language, "telegram_direct"), 
-                    callback_data="storage_telegram"
-                )],
-                [InlineKeyboardButton(
-                    text=get_text(user.language, "save_gdrive"), 
-                    callback_data="storage_gdrive"
-                )],
-            ])
-            
-            await status_msg.edit_text(
-                get_text(user.language, "file_info", size=f"{file_size_mb:.1f}"),
-                reply_markup=keyboard
-            )
-            await state.set_state(DownloadStates.selecting_storage)
-            await callback.answer()
-            return
-        
-        # Upload small files directly (< 50MB)
-        await status_msg.edit_text(
-            get_text(user.language, "uploading", progress="0")
+        # Show storage options for all files
+        await state.update_data(
+            file_path=str(file_path), 
+            file_size_mb=file_size_mb,
+            format_type=format_type
         )
         
-        if format_type == "audio":
-            await callback.message.answer_audio(
-                FSInputFile(file_path),
-                caption=get_text(user.language, "completed")
-            )
-        else:
-            await callback.message.answer_video(
-                FSInputFile(file_path),
-                caption=get_text(user.language, "completed"),
-                supports_streaming=True
-            )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=get_text(user.language, "telegram_direct"), 
+                callback_data="storage_telegram"
+            )],
+            [InlineKeyboardButton(
+                text=get_text(user.language, "save_gdrive"), 
+                callback_data="storage_gdrive"
+            )],
+        ])
         
-        await status_msg.delete()
-        
-        # Update user stats
-        async with async_session() as session:
-            result = await session.execute(
-                select(User).where(User.telegram_id == user.telegram_id)
-            )
-            db_user = result.scalar_one()
-            db_user.total_downloads += 1
-            await session.commit()
+        await status_msg.edit_text(
+            get_text(user.language, "file_info", size=f"{file_size_mb:.1f}"),
+            reply_markup=keyboard
+        )
+        await state.set_state(DownloadStates.selecting_storage)
+        await callback.answer()
         
     except Exception as e:
         logger.error(f"Download failed: {e}")
         await status_msg.edit_text(
             get_text(user.language, "failed", error=str(e))
         )
-    finally:
-        # Always cleanup file from VPS
         if file_path:
             await cleanup_file(file_path)
-    
-    await state.clear()
-    await callback.answer()
+        await state.clear()
+        await callback.answer()
 
 @dp.callback_query(F.data.startswith("storage_"))
 async def callback_storage(callback: types.CallbackQuery, state: FSMContext):
@@ -589,24 +560,24 @@ async def callback_storage(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     
     file_path = Path(data.get("file_path"))
-    file_size_mb = data.get("file_size_mb", 0)
-    format_type = data.get("format")
+    file_size_mb = data.get("file_size_mb")
+    format_type = data.get("format_type")
     user = await get_or_create_user(callback.from_user.id)
     
     try:
         if storage_type == "telegram":
-            # Upload to Telegram using Pyrogram (up to 4GB)
+            # Upload to Telegram using Pyrogram (supports up to 4GB)
             status_msg = await callback.message.edit_text(
                 get_text(user.language, "uploading_telegram", progress="0")
             )
             
-            is_audio = format_type == "audio"
+            is_audio = (format_type == "audio")
             caption = get_text(user.language, "completed")
             
-            # Use Pyrogram for large file upload
+            # Use Pyrogram for upload
             success = await upload_large_file_pyrogram(
                 file_path=file_path,
-                chat_id=callback.message.chat.id,
+                chat_id=callback.from_user.id,
                 caption=caption,
                 status_msg=status_msg,
                 user_lang=user.language,
@@ -616,9 +587,9 @@ async def callback_storage(callback: types.CallbackQuery, state: FSMContext):
             if success:
                 await status_msg.delete()
             else:
-                await status_msg.edit_text(
-                    get_text(user.language, "failed", error="Upload failed")
-                )
+                await status_msg.edit_text("❌ Upload failed. Try Google Drive option.")
+                await callback.answer()
+                return
             
         elif storage_type == "gdrive":
             # Check if GDrive is connected
@@ -686,9 +657,9 @@ async def cleanup_old_files():
 async def main():
     """Main function"""
     logger.info("Starting YouTube Download Bot with Pyrogram...")
-    logger.info(f"API ID: {API_ID}")
     logger.info(f"Admin IDs: {ADMIN_USER_IDS}")
     logger.info(f"Max file size: {TELEGRAM_UPLOAD_LIMIT_MB}MB (4GB via Pyrogram)")
+    logger.info(f"API ID: {API_ID}")
     logger.info(f"Storage backend: {STORAGE_BACKEND}")
     
     # Initialize database
@@ -705,11 +676,16 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
-        await app.stop()
         await bot.session.close()
+        await app.stop()
 
 if __name__ == "__main__":
-    asyncio.run(main())1]
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}", exc_info=True)1]
     data = await state.get_data()
     
     url = data.get("url")
